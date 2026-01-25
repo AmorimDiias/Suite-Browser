@@ -1,4 +1,4 @@
-# tube-silo
+# Suite Browser
 
 An Electron application with React and TypeScript
 
