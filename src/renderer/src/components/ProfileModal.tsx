@@ -40,7 +40,12 @@ export function ProfileModal({
   const [imageSrc, setImageSrc] = useState<string | null>(null)
   const [crop, setCrop] = useState({ x: 0, y: 0 })
   const [zoom, setZoom] = useState(1)
-  const [croppedAreaPixels, setCroppedAreaPixels] = useState<any>(null)
+  const [croppedAreaPixels, setCroppedAreaPixels] = useState<{
+    x: number
+    y: number
+    width: number
+    height: number
+  } | null>(null)
   const [isCropping, setIsCropping] = useState(false)
 
   const handleCountryChange = (e: React.ChangeEvent<HTMLSelectElement>): void => {
@@ -56,7 +61,7 @@ export function ProfileModal({
     }
   }
 
-  const onFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const onFileChange = async (e: React.ChangeEvent<HTMLInputElement>): Promise<void> => {
     if (e.target.files && e.target.files.length > 0) {
       const file = e.target.files[0]
       const imageDataUrl = await readFile(file)
@@ -65,7 +70,7 @@ export function ProfileModal({
     }
   }
 
-  const readFile = (file: File) => {
+  const readFile = (file: File): Promise<string | ArrayBuffer | null> => {
     return new Promise((resolve) => {
       const reader = new FileReader()
       reader.addEventListener('load', () => resolve(reader.result), false)
@@ -77,7 +82,7 @@ export function ProfileModal({
     setCroppedAreaPixels(croppedAreaPixels)
   }, [])
 
-  const handleCropSave = async () => {
+  const handleCropSave = async (): Promise<void> => {
     if (imageSrc && croppedAreaPixels) {
       try {
         const croppedImage = await getCroppedImg(imageSrc, croppedAreaPixels)
@@ -95,13 +100,16 @@ export function ProfileModal({
   if (!isOpen) return null
 
   return (
-    <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-      <div className="bg-gray-800 border border-gray-700 rounded-xl shadow-2xl w-full max-w-lg max-h-[90vh] flex flex-col animate-in fade-in zoom-in-95 duration-200">
-        <div className="flex-shrink-0 flex items-center justify-between px-6 py-4 border-b border-gray-700 bg-gray-900/50">
-          <h3 className="text-lg font-semibold text-white">
+    <div className="fixed inset-0 bg-gray-900/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+      <div className="bg-white dark:bg-gray-800 rounded-xl shadow-2xl w-full max-w-lg max-h-[90vh] flex flex-col animate-in fade-in zoom-in-95 duration-200 border border-gray-100 dark:border-gray-700">
+        <div className="flex-shrink-0 flex items-center justify-between px-6 py-4 border-b border-gray-100 dark:border-gray-700 bg-gray-50/50 dark:bg-gray-800/50 rounded-t-xl">
+          <h3 className="text-lg font-bold text-gray-900 dark:text-white">
             {initialData ? 'Editar Perfil' : 'Novo Perfil'}
           </h3>
-          <button onClick={onClose} className="text-gray-400 hover:text-white transition-colors">
+          <button
+            onClick={onClose}
+            className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 p-1 rounded-full transition-colors"
+          >
             <X size={20} />
           </button>
         </div>
@@ -109,7 +117,7 @@ export function ProfileModal({
         <div className="p-6 space-y-6 overflow-y-auto flex-1 custom-scrollbar">
           {/* Cropper UI Override */}
           {isCropping && imageSrc ? (
-            <div className="relative h-64 w-full bg-black rounded-lg overflow-hidden border border-gray-600">
+            <div className="relative h-64 w-full bg-gray-900 rounded-lg overflow-hidden border border-gray-200 dark:border-gray-600 shadow-inner">
               <Cropper
                 image={imageSrc}
                 crop={crop}
@@ -128,13 +136,13 @@ export function ProfileModal({
                   step={0.1}
                   aria-labelledby="Zoom"
                   onChange={(e) => setZoom(Number(e.target.value))}
-                  className="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer range-sm"
+                  className="w-full h-1 bg-white/20 rounded-lg appearance-none cursor-pointer range-sm"
                 />
               </div>
               <div className="absolute top-2 right-2 flex gap-2">
                 <button
                   onClick={() => setIsCropping(false)}
-                  className="bg-red-500/80 p-1.5 rounded hover:bg-red-600 text-white"
+                  className="bg-white/90 p-1.5 rounded-full hover:bg-white text-gray-700 shadow-sm"
                 >
                   <X size={16} />
                 </button>
@@ -143,7 +151,7 @@ export function ProfileModal({
           ) : (
             <div className="flex flex-col items-center justify-center gap-4">
               <div className="relative group">
-                <div className="w-24 h-24 rounded-full bg-gray-700 flex items-center justify-center overflow-hidden border-2 border-dashed border-gray-600 group-hover:border-blue-500 transition-colors">
+                <div className="w-24 h-24 rounded-full bg-gray-50 dark:bg-gray-700 flex items-center justify-center overflow-hidden border-2 border-dashed border-gray-300 dark:border-gray-600 group-hover:border-blue-500 transition-all shadow-sm">
                   {formData.avatar && formData.avatar.startsWith('data:') ? (
                     <img
                       src={formData.avatar}
@@ -157,8 +165,8 @@ export function ProfileModal({
                       className="w-full h-full object-cover"
                     />
                   ) : (
-                    <span className="text-4xl">
-                      {formData.avatar || <ImageIcon size={32} className="text-gray-500" />}
+                    <span className="text-4xl text-gray-400 dark:text-gray-500">
+                      {formData.avatar || <ImageIcon size={32} />}
                     </span>
                   )}
                 </div>
@@ -170,7 +178,7 @@ export function ProfileModal({
               {isCropping && (
                 <button
                   onClick={handleCropSave}
-                  className="text-xs bg-blue-600 px-3 py-1 rounded text-white"
+                  className="text-xs bg-blue-600 px-3 py-1 rounded text-white shadow-sm"
                 >
                   Salvar Recorte
                 </button>
@@ -182,7 +190,7 @@ export function ProfileModal({
             <div className="flex justify-end">
               <button
                 onClick={handleCropSave}
-                className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded text-sm font-medium"
+                className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-bold shadow-lg shadow-blue-600/20"
               >
                 Confirmar Recorte
               </button>
@@ -192,27 +200,27 @@ export function ProfileModal({
           {!isCropping && (
             <>
               <div>
-                <label className="block text-xs font-medium text-gray-400 mb-1 uppercase tracking-wide">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 mb-1.5 uppercase tracking-wide">
                   Nome do Perfil
                 </label>
                 <input
                   type="text"
                   value={formData.name}
                   onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                  className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-2.5 text-gray-200 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none transition-all"
+                  className="w-full bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg px-4 py-2.5 text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 outline-none transition-all shadow-sm"
                   placeholder="Ex: Canal Dark 01"
                 />
               </div>
 
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1 uppercase tracking-wide">
+                  <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 mb-1.5 uppercase tracking-wide">
                     País / Região
                   </label>
                   <select
                     value={formData.country}
                     onChange={handleCountryChange}
-                    className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-2.5 text-gray-200 outline-none focus:border-blue-500"
+                    className="w-full bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg px-4 py-2.5 text-gray-900 dark:text-white outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 shadow-sm appearance-none"
                   >
                     {COUNTRIES.map((c) => (
                       <option key={c.code} value={c.code}>
@@ -222,68 +230,78 @@ export function ProfileModal({
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1 uppercase tracking-wide">
+                  <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 mb-1.5 uppercase tracking-wide">
                     Avatar (Emoji/URL)
                   </label>
                   <input
                     type="text"
                     value={formData.avatar}
                     onChange={(e) => setFormData({ ...formData, avatar: e.target.value })}
-                    className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-2.5 text-gray-200 outline-none focus:border-blue-500"
+                    className="w-full bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg px-4 py-2.5 text-gray-900 dark:text-white outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 shadow-sm"
                     placeholder="🤖, http://... ou Upload"
                   />
-                  <p className="text-[10px] text-gray-500 mt-1">
+                  <p className="text-[10px] text-gray-500 dark:text-gray-400 mt-1">
                     Clique na imagem acima para enviar um arquivo
                   </p>
                 </div>
               </div>
 
               <div>
-                <label className="block text-xs font-medium text-gray-400 mb-1 uppercase tracking-wide">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 mb-1.5 uppercase tracking-wide">
                   Proxy{' '}
-                  <span className="text-gray-600 normal-case">(http://user:pass@ip:port)</span>
+                  <span className="text-gray-500 dark:text-gray-400 font-normal normal-case">
+                    (http://user:pass@ip:port)
+                  </span>
                 </label>
                 <input
                   type="text"
                   value={formData.proxy}
                   onChange={(e) => setFormData({ ...formData, proxy: e.target.value })}
-                  className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-2.5 text-gray-200 font-mono text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none transition-all"
+                  className="w-full bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg px-4 py-2.5 text-gray-900 dark:text-white font-mono text-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 outline-none transition-all shadow-sm"
                   placeholder="http://user:pass@192.168.1.1:8080"
                 />
               </div>
 
-              <div className="grid grid-cols-2 gap-4 text-xs text-gray-500 bg-gray-900/50 p-3 rounded-lg border border-gray-700/50">
+              <div className="grid grid-cols-2 gap-4 text-xs text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-gray-900/50 p-3 rounded-lg border border-gray-200 dark:border-gray-700">
                 <div>
-                  <span className="block mb-1">Timezone Detectado:</span>
-                  <code className="text-gray-300">{formData.timezone}</code>
+                  <span className="block mb-1 font-medium text-gray-500 dark:text-gray-500">
+                    Timezone Detectado:
+                  </span>
+                  <code className="text-gray-800 dark:text-gray-200 bg-white dark:bg-gray-800 px-1 py-0.5 rounded border border-gray-200 dark:border-gray-600 font-bold">
+                    {formData.timezone}
+                  </code>
                 </div>
                 <div>
-                  <span className="block mb-1">Locale Detectado:</span>
-                  <code className="text-gray-300">{formData.locale}</code>
+                  <span className="block mb-1 font-medium text-gray-500 dark:text-gray-500">
+                    Locale Detectado:
+                  </span>
+                  <code className="text-gray-800 dark:text-gray-200 bg-white dark:bg-gray-800 px-1 py-0.5 rounded border border-gray-200 dark:border-gray-600 font-bold">
+                    {formData.locale}
+                  </code>
                 </div>
               </div>
 
               <div>
-                <label className="block text-xs font-medium text-gray-400 mb-1 uppercase tracking-wide">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 mb-1.5 uppercase tracking-wide">
                   User Agent (Opcional)
                 </label>
                 <input
                   type="text"
                   value={formData.userAgent || ''}
                   onChange={(e) => setFormData({ ...formData, userAgent: e.target.value })}
-                  className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-2.5 text-gray-200 text-xs focus:border-blue-500 outline-none"
+                  className="w-full bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg px-4 py-2.5 text-gray-900 dark:text-white text-xs focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 outline-none shadow-sm"
                   placeholder="Mozilla/5.0..."
                 />
               </div>
 
               <div>
-                <label className="block text-xs font-medium text-gray-400 mb-1 uppercase tracking-wide">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 mb-1.5 uppercase tracking-wide">
                   Notas
                 </label>
                 <textarea
                   value={formData.notes || ''}
                   onChange={(e) => setFormData({ ...formData, notes: e.target.value })}
-                  className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-2.5 text-gray-200 text-sm focus:border-blue-500 outline-none h-20 resize-none"
+                  className="w-full bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg px-4 py-2.5 text-gray-900 dark:text-white text-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 outline-none h-20 resize-none shadow-sm"
                   placeholder="Informações adicionais sobre o canal..."
                 />
               </div>
@@ -291,10 +309,10 @@ export function ProfileModal({
           )}
         </div>
 
-        <div className="px-6 py-4 bg-gray-900/50 border-t border-gray-700 flex justify-end gap-3">
+        <div className="px-6 py-4 bg-gray-50 dark:bg-gray-800/80 rounded-b-xl border-t border-gray-100 dark:border-gray-700 flex justify-end gap-3">
           <button
             onClick={onClose}
-            className="px-4 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-800 transition-colors"
+            className="px-4 py-2.5 rounded-lg text-sm font-medium text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
           >
             Cancelar
           </button>
@@ -302,7 +320,7 @@ export function ProfileModal({
             <button
               onClick={() => onSave(formData)}
               disabled={!formData.name}
-              className="px-6 py-2 rounded-lg text-sm font-medium bg-blue-600 hover:bg-blue-500 text-white shadow-lg disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+              className="px-6 py-2.5 rounded-lg text-sm font-bold bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-600/20 disabled:opacity-50 disabled:cursor-not-allowed transition-all active:scale-[0.98]"
             >
               Salvar Perfil
             </button>

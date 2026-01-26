@@ -14,14 +14,41 @@ export interface Profile {
   userAgent?: string
   notes?: string
   lastUsed?: string
+  totalDataUsage?: number // Bytes
+  proxyStatus?: 'online' | 'offline' | 'checking' | 'unknown'
 }
 
 // In dev: root/data/profiles.json
 // In prod: userData/profiles.json (copied from resources/data/profiles.json on first run)
 const getPath = (): string => {
+  // 1. Dev Mode
   if (!app.isPackaged) {
     return path.join(process.cwd(), 'data', 'profiles.json')
   }
+
+  const appDir = path.dirname(app.getPath('exe'))
+
+  // 2. Portable Mode - Option A: root/profiles.json
+  const rootPortablePath = path.join(appDir, 'profiles.json')
+  if (fs.existsSync(rootPortablePath)) {
+    return rootPortablePath
+  }
+
+  // 3. Portable Mode - Option B: root/data/profiles.json
+  const dataPortablePath = path.join(appDir, 'data', 'profiles.json')
+  if (fs.existsSync(dataPortablePath)) {
+    return dataPortablePath
+  }
+
+  // Fallback: If 'data' or 'browser_data' folder exists in root, we SHOULD stay in root (Portable intentions)
+  if (
+    fs.existsSync(path.join(appDir, 'data')) ||
+    fs.existsSync(path.join(appDir, 'browser_data'))
+  ) {
+    return dataPortablePath // Even if it doesn't exist yet, we'll create it here
+  }
+
+  // 4. Standard Installed Mode
   return path.join(app.getPath('userData'), 'profiles.json')
 }
 

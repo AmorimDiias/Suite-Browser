@@ -1,9 +1,10 @@
-import { app, shell, BrowserWindow, ipcMain } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, dialog } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import { ProfileManager } from './profiles'
-import { launchProfile, stopProfile, setMainWindow } from './engine'
+import { launchProfile, stopProfile, setMainWindow, closeAllProfiles } from './engine'
+import { checkProxyHealth } from './proxy-checker'
 
 let mainWindow: BrowserWindow | null = null
 
@@ -81,8 +82,16 @@ app.whenReady().then(() => {
     console.log('Launch requested for:', profileId)
     try {
       await launchProfile(profileId)
-    } catch (error) {
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
       console.error('Failed to launch profile:', error)
+      dialog.showErrorBox(
+        'Falha ao Iniciar Perfil',
+        `Erro ao iniciar o navegador:\n${errorMessage}`
+      )
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('profile-launch-error', errorMessage)
+      }
     }
   })
 
@@ -95,6 +104,23 @@ app.whenReady().then(() => {
     }
   })
 
+  // ... existing imports
+
+  ipcMain.handle('check-proxy-health', async (_, profileId) => {
+    const profile = await ProfileManager.getById(profileId)
+    if (!profile) return 'unknown'
+
+    const status = await checkProxyHealth(profile)
+
+    // Optional: Persist status if you want it to survive restarts,
+    // but usually health is transient. We will update it so the frontend gets the new data
+    // if it re-fetches, but ideally frontend keeps track of it.
+    // Let's update it in the DB to represent "last known status".
+    await ProfileManager.update(profileId, { proxyStatus: status })
+
+    return status
+  })
+
   createWindow()
 
   app.on('activate', function () {
@@ -102,6 +128,13 @@ app.whenReady().then(() => {
     // dock icon is clicked and there are no other windows open.
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })
+})
+
+// Ensure profiles are closed before quitting to prevent corruption
+app.on('before-quit', async (e) => {
+  e.preventDefault() // Pause quit
+  await closeAllProfiles()
+  app.exit() // Resume quit forcedly
 })
 
 // Quit when all windows are closed, except on macOS. There, it's common

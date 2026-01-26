@@ -9,4 +9,6 @@ export interface Profile {
   userAgent?: string
   notes?: string
   lastUsed?: string
+  totalDataUsage?: number
+  proxyStatus?: 'online' | 'offline' | 'checking' | 'unknown'
 }
