@@ -391,7 +391,11 @@ export async function launchProfile(profileId: string): Promise<BrowserContext> 
 
     const page = context.pages().length > 0 ? context.pages()[0] : await context.newPage()
 
-    await page.goto('https://www.google.com', { waitUntil: 'domcontentloaded' })
+    try {
+      await page.goto('https://www.google.com', { waitUntil: 'domcontentloaded', timeout: 15000 })
+    } catch (navError) {
+      console.warn('[Engine] Initial navigation failed:', navError)
+    }
 
     return context
   } catch (error: unknown) {
