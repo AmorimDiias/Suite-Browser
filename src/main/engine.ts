@@ -57,11 +57,19 @@ export async function launchProfile(profileId: string): Promise<BrowserContext> 
   let baseDataDir = ''
 
   if (app.isPackaged) {
-    // Check for portable browser_data next to executable
-    const portableDataDir = path.join(path.dirname(app.getPath('exe')), 'browser_data')
-    if (fs.existsSync(portableDataDir)) {
-      baseDataDir = portableDataDir
-      console.log('Using portable browser_data:', baseDataDir)
+    const appDir = path.dirname(app.getPath('exe'))
+    const resDir = process.resourcesPath
+
+    // Checa Root e Resources
+    const rootData = path.join(appDir, 'browser_data')
+    const resData = path.join(resDir, 'browser_data')
+
+    if (fs.existsSync(rootData)) {
+      baseDataDir = rootData
+      console.log('Using portable browser_data (root):', baseDataDir)
+    } else if (fs.existsSync(resData)) {
+      baseDataDir = resData
+      console.log('Using browser_data from resources:', baseDataDir)
     } else {
       baseDataDir = path.join(app.getPath('userData'), 'browser_data')
     }
