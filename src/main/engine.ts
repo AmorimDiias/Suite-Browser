@@ -25,6 +25,48 @@ const GEOLOCATIONS: Record<string, { latitude: number; longitude: number }> = {
   CA: { latitude: 45.4215, longitude: -75.6972 } // Ottawa
 }
 
+// Helper to generate deterministic fingerprint protected config from Profile ID
+function generateFingerprint(profileId: string) {
+  let hash = 0
+  for (let i = 0; i < profileId.length; i++) {
+    const char = profileId.charCodeAt(i)
+    hash = (hash << 5) - hash + char
+    hash = hash & hash // Convert to 32bit integer
+  }
+  const seed = Math.abs(hash)
+
+  // Curated list of high-entropy GPUs to rotate
+  const vendors = [
+    {
+      vendor: 'Google Inc. (NVIDIA)',
+      renderer: 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0)'
+    },
+    {
+      vendor: 'Google Inc. (NVIDIA)',
+      renderer: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0)'
+    },
+    {
+      vendor: 'Google Inc. (NVIDIA)',
+      renderer: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 Direct3D11 vs_5_0 ps_5_0)'
+    },
+    {
+      vendor: 'Google Inc. (AMD)',
+      renderer: 'ANGLE (AMD, AMD Radeon RX 6600 XT Direct3D11 vs_5_0 ps_5_0)'
+    },
+    {
+      vendor: 'Google Inc. (Intel)',
+      renderer: 'ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0)'
+    }
+  ]
+  const gpu = vendors[seed % vendors.length]
+
+  return {
+    seed,
+    vendor: gpu.vendor,
+    renderer: gpu.renderer
+  }
+}
+
 function getGeolocation(countryCode: string): {
   latitude: number
   longitude: number
@@ -155,8 +197,14 @@ export async function launchProfile(profileId: string): Promise<BrowserContext> 
     })
     console.log(`[Engine] Browser context created successfully.`)
 
+    // Generate deterministic fingerprint data
+    const fingerprintArgs = generateFingerprint(profile.id)
+    console.log(`[Engine] Injecting Fingerprint Protection:`, fingerprintArgs)
+
     // STEALTH VIA JS (Recusa robusta de fingerprinting)
-    await context.addInitScript(() => {
+    await context.addInitScript((args) => {
+      const { seed, vendor, renderer } = args
+
       // --- UTILS: Native Code Emulation ---
       // Make our overrides look like native functions
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -169,6 +217,101 @@ export async function launchProfile(profileId: string): Promise<BrowserContext> 
         })
         // @ts-ignore: defining name property
         Object.defineProperty(func, 'name', { value: key, configurable: true })
+      }
+
+      // --- CANVAS FINGERPRINT PROTECTION (NOISE INJECTION) ---
+      try {
+        const originalToDataURL = HTMLCanvasElement.prototype.toDataURL
+        const originalToBlob = HTMLCanvasElement.prototype.toBlob
+        const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData
+
+        // Deterministic PRNG based on Seed
+        const getNoise = (index: number, channel: number): number => {
+          const base = (seed % 100000) + index * 0.01 + channel * 10
+          const random = Math.sin(base) * 10000
+          const noise = Math.floor(random) % 4
+          // 25% chance of -1, 25% chance of 1, 50% chance of 0 (roughly)
+          if (noise === 0) return -1
+          if (noise === 1) return 1
+          return 0
+        }
+
+        // 1. Intercept getImageData (The core of 2D fingerprinting)
+        // @ts-ignore: overwriting getImageData
+        CanvasRenderingContext2D.prototype.getImageData = function (
+          x: number,
+          y: number,
+          w: number,
+          h: number,
+          settings?: ImageDataSettings
+        ) {
+          // @ts-ignore: calling original
+          const imageData = originalGetImageData.apply(this, [x, y, w, h, settings])
+          if (!imageData) return imageData
+
+          const { width, height, data } = imageData
+
+          for (let i = 0; i < height; i++) {
+            for (let j = 0; j < width; j++) {
+              const pixelIndex = i * width + j
+              const arrayIndex = pixelIndex * 4
+              // Modify RGB slightly
+              data[arrayIndex] += getNoise(pixelIndex, 0)
+              data[arrayIndex + 1] += getNoise(pixelIndex, 1)
+              data[arrayIndex + 2] += getNoise(pixelIndex, 2)
+            }
+          }
+          return imageData
+        }
+        makeNative(CanvasRenderingContext2D.prototype.getImageData, 'getImageData')
+
+        // 2. Intercept toDataURL
+        // @ts-ignore: overwriting toDataURL
+        HTMLCanvasElement.prototype.toDataURL = function (type?: string, encoderOptions?: any) {
+          const context = this.getContext('2d')
+          if (context) {
+            const w = this.width
+            const h = this.height
+            const noisyData = context.getImageData(0, 0, w, h)
+            const shadowCanvas = document.createElement('canvas')
+            shadowCanvas.width = w
+            shadowCanvas.height = h
+            const shadowCtx = shadowCanvas.getContext('2d')
+            if (shadowCtx) {
+              shadowCtx.putImageData(noisyData, 0, 0)
+              return originalToDataURL.apply(shadowCanvas, [type, encoderOptions])
+            }
+          }
+          return originalToDataURL.apply(this, [type, encoderOptions])
+        }
+        makeNative(HTMLCanvasElement.prototype.toDataURL, 'toDataURL')
+
+        // 3. Intercept toBlob
+        // @ts-ignore: overwriting toBlob
+        HTMLCanvasElement.prototype.toBlob = function (
+          callback: BlobCallback,
+          type?: string,
+          quality?: any
+        ) {
+          const context = this.getContext('2d')
+          if (context) {
+            const w = this.width
+            const h = this.height
+            const noisyData = context.getImageData(0, 0, w, h)
+            const shadowCanvas = document.createElement('canvas')
+            shadowCanvas.width = w
+            shadowCanvas.height = h
+            const shadowCtx = shadowCanvas.getContext('2d')
+            if (shadowCtx) {
+              shadowCtx.putImageData(noisyData, 0, 0)
+              return originalToBlob.apply(shadowCanvas, [callback, type, quality])
+            }
+          }
+          return originalToBlob.apply(this, [callback, type, quality])
+        }
+        makeNative(HTMLCanvasElement.prototype.toBlob, 'toBlob')
+      } catch (e) {
+        console.error('Failed to inject Canvas noise:', e)
       }
 
       // --- 1. WEBDRIVER (The most common tell) ---
@@ -229,22 +372,34 @@ export async function launchProfile(profileId: string): Promise<BrowserContext> 
         makeNative(navigator.permissions.query, 'query')
       }
 
-      // --- 4. WEBGL VENDOR/RENDERER ---
+      // --- 4. WEBGL VENDOR/RENDERER (Dynamic Spoofing) ---
       try {
         const getParameter = WebGLRenderingContext.prototype.getParameter
         // @ts-ignore: overwriting getParameter
         WebGLRenderingContext.prototype.getParameter = function (parameter) {
           // UNMASKED_VENDOR_WEBGL
           if (parameter === 37445) {
-            return 'Google Inc. (NVIDIA)'
+            return vendor
           }
           // UNMASKED_RENDERER_WEBGL
           if (parameter === 37446) {
-            return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1050 Ti Direct3D11 vs_5_0 ps_5_0, or similar)'
+            return renderer
           }
           return getParameter.apply(this, [parameter])
         }
         makeNative(WebGLRenderingContext.prototype.getParameter, 'getParameter')
+
+        // Handle WebGL2
+        if (typeof WebGL2RenderingContext !== 'undefined') {
+          const getParameter2 = WebGL2RenderingContext.prototype.getParameter
+          // @ts-ignore: overwriting getParameter
+          WebGL2RenderingContext.prototype.getParameter = function (parameter) {
+            if (parameter === 37445) return vendor
+            if (parameter === 37446) return renderer
+            return getParameter2.apply(this, [parameter])
+          }
+          makeNative(WebGL2RenderingContext.prototype.getParameter, 'getParameter')
+        }
       } catch {
         // ignore
       }
@@ -277,7 +432,7 @@ export async function launchProfile(profileId: string): Promise<BrowserContext> 
         // @ts-ignore: fixing makeNative type compatibility
         makeNative(window.RTCPeerConnection, 'RTCPeerConnection')
       }
-    })
+    }, fingerprintArgs)
 
     // Store context
     runningContexts.set(profileId, context)
