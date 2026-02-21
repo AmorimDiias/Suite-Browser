@@ -1,7 +1,8 @@
-import { BrowserContext, chromium as playwrightChromium } from 'playwright'
+import { BrowserContext, Page, chromium as playwrightChromium } from 'playwright'
 import path from 'path'
 import fs from 'fs-extra'
-import { ProfileManager } from './profiles'
+import { ProfileManager, Profile } from './profiles'
+import { createProxyForwarder, ForwarderResult } from './proxyForwarder'
 import { app, BrowserWindow } from 'electron'
 
 // Reference to main window for IPC communication
@@ -25,8 +26,123 @@ const GEOLOCATIONS: Record<string, { latitude: number; longitude: number }> = {
   CA: { latitude: 45.4215, longitude: -75.6972 } // Ottawa
 }
 
+interface UserAgentBundle {
+  userAgent: string
+  userAgentMetadata: {
+    brands: Array<{ brand: string; version: string }>
+    fullVersionList: Array<{ brand: string; version: string }>
+    platform: string
+    platformVersion: string
+    architecture: string
+    model: string
+    mobile: boolean
+    bitness: string
+    wow64: boolean
+  }
+}
+
+function buildUserAgentBundle(profile: Profile): UserAgentBundle {
+  // Se o perfil não tiver UA, usamos um padrão extremamente comum (Chrome/Windows) como base para a higienização
+  const ua =
+    profile.userAgent ||
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36'
+
+  const platformMap: Record<string, string> = {
+    // ... (mapeamento mantido)
+    DE: 'Windows',
+    FR: 'Windows',
+    US: 'Windows',
+    ES: 'Windows',
+    BR: 'Windows',
+    CO: 'Windows',
+    GB: 'Windows',
+    CA: 'Windows'
+  }
+
+  const chromeFullVersionMatch = ua.match(/Chrome\/(\d+\.\d+\.\d+\.\d+)/)
+  const chromeMajorVersionMatch = ua.match(/Chrome\/(\d+)/)
+
+  const MAX_SAFE_MAJOR = 135
+  const FALLBACK_FULL = '133.0.6943.141'
+  const FALLBACK_MAJOR = '133'
+
+  let chromeFullVersion = chromeFullVersionMatch ? chromeFullVersionMatch[1] : FALLBACK_FULL
+  let chromeMajorVersion = chromeMajorVersionMatch ? chromeMajorVersionMatch[1] : FALLBACK_MAJOR
+  let finalUa = ua
+
+  if (parseInt(chromeMajorVersion, 10) > MAX_SAFE_MAJOR) {
+    console.warn(
+      `[Engine] Versão suspeita de Chrome detectada (${chromeMajorVersion}). Normalizando para ${FALLBACK_MAJOR}.`
+    )
+    chromeFullVersion = FALLBACK_FULL
+    chromeMajorVersion = FALLBACK_MAJOR
+    // Replace robusto: captura Chrome/ seguido de qualquer versão até o próximo espaço ou fim de string
+    finalUa = ua.replace(/Chrome\/[\d.]+/, `Chrome/${FALLBACK_FULL}`)
+  }
+
+  const platform = platformMap[profile.country] || 'Windows'
+
+  const brands = [
+    { brand: 'Google Chrome', version: chromeMajorVersion },
+    { brand: 'Chromium', version: chromeMajorVersion },
+    { brand: 'Not A;Brand', version: '99' }
+  ]
+
+  const fullVersionList = [
+    { brand: 'Google Chrome', version: chromeFullVersion },
+    { brand: 'Chromium', version: chromeFullVersion },
+    { brand: 'Not A;Brand', version: '99.0.0.0' }
+  ]
+
+  const platformVersion = platform === 'Windows' ? '10.0.0' : '14.0.0'
+
+  return {
+    userAgent: finalUa,
+    userAgentMetadata: {
+      brands,
+      fullVersionList,
+      platform,
+      platformVersion,
+      architecture: 'x86',
+      model: '',
+      mobile: false,
+      bitness: '64',
+      wow64: false
+    }
+  }
+}
+
+const SPOOFED_SCREEN = { width: 1920, height: 1080 }
+
+async function applyUAOverride(
+  page: Page,
+  bundle: UserAgentBundle,
+  profileLocale?: string
+): Promise<void> {
+  try {
+    const client = await page.context().newCDPSession(page)
+
+    // Emulation.setUserAgentOverride é persistente (sobrevive ao detach e navegações)
+    // Diferente do Network.setUserAgentOverride que seria resetado após o client.detach()
+    await client.send('Emulation.setUserAgentOverride', {
+      userAgent: bundle.userAgent,
+      acceptLanguage: profileLocale || 'de-DE',
+      platform: bundle.userAgentMetadata.platform,
+      userAgentMetadata: bundle.userAgentMetadata
+    })
+
+    client.detach().catch(() => {})
+  } catch (e) {
+    console.warn('[Engine] Falha ao aplicar UA override via CDP:', e)
+  }
+}
+
 // Helper to generate deterministic fingerprint protected config from Profile ID
-function generateFingerprint(profileId: string) {
+function generateFingerprint(profileId: string): {
+  seed: number
+  vendor: string
+  renderer: string
+} {
   let hash = 0
   for (let i = 0; i < profileId.length; i++) {
     const char = profileId.charCodeAt(i)
@@ -122,28 +238,84 @@ export async function launchProfile(profileId: string): Promise<BrowserContext> 
   const userDataDir = path.join(baseDataDir, profileId)
   fs.ensureDirSync(userDataDir)
 
-  // 2. Configure Proxy with credentials
+  // 2. Configurar proxy com suporte a SOCKS5 autenticado via forwarder local
   let proxyConfig: { server: string; username?: string; password?: string } | undefined
+  let proxyProtocol = ''
+  let proxyHost = ''
+  let proxyPort = ''
+  let forwarder: ForwarderResult | null = null
 
   if (profile.proxy && profile.proxy.includes('://')) {
     const url = new URL(profile.proxy)
-    proxyConfig = {
-      server: `${url.protocol}//${url.hostname}:${url.port}`,
-      username: url.username || undefined,
-      password: url.password || undefined
+    proxyProtocol = url.protocol.replace(':', '')
+    proxyHost = url.hostname
+    proxyPort = url.port
+
+    const isSocks5 = proxyProtocol === 'socks5' || proxyProtocol === 'socks5h'
+    const hasAuth = !!url.username
+
+    if (isSocks5 && hasAuth) {
+      // Chromium não suporta autenticação nativa em SOCKS5.
+      // Solução: subir um forwarder local sem auth → ele autentica com o proxy real.
+      forwarder = await createProxyForwarder({
+        proxyHost,
+        proxyPort: parseInt(proxyPort, 10),
+        username: url.username,
+        password: url.password
+      })
+
+      proxyConfig = {
+        // Chromium aponta para o tunel local sem auth — isolamento total mantido
+        server: `socks5://127.0.0.1:${forwarder.port}`,
+        username: undefined,
+        password: undefined
+      }
+    } else {
+      proxyConfig = {
+        server: isSocks5
+          ? `socks5://${proxyHost}:${proxyPort}`
+          : `${url.protocol}//${proxyHost}:${proxyPort}`,
+        username: url.username || undefined,
+        password: url.password || undefined
+      }
     }
   }
 
   console.log(`[Engine] Launching profile ${profile.id} (${profile.name})`)
   console.log(`[Engine] Directory: ${userDataDir}`)
-  console.log(`[Engine] Proxy: ${proxyConfig ? 'Configured with auth' : 'None'}`)
+  console.log(
+    `[Engine] Proxy: ${proxyConfig ? (forwarder ? `Forwarder local → ${proxyHost}:${proxyPort}` : 'Direto') : 'None'}`
+  )
 
   if (proxyConfig) {
     console.log(`[Engine] Proxy Server: ${proxyConfig.server}`)
   }
 
+  // uaBundle sempre construído: se o perfil estiver vazio, usa um Chrome/Win padrão higienizado
+  const uaBundle = buildUserAgentBundle(profile)
+
   try {
-    console.log(`[Engine] Attempting playwrightChromium.launchPersistentContext...`)
+    const isSocks5Proxy = proxyProtocol === 'socks5' || proxyProtocol === 'socks5h'
+
+    // Flags de isolamento de rede — eliminam DNS leak via proxy
+    const networkIsolationArgs: string[] = proxyConfig
+      ? [
+          // Desativa prefetch de DNS que ocorre fora do proxy
+          '--dns-prefetch-disable',
+          // Desativa conexões especulativas (TCP e DNS) fora do proxy
+          '--disable-background-networking',
+          '--no-pings',
+          // Kill Switch de DNS: bloqueia resolver local como fallback
+          '--host-resolver-rules=MAP * ~NOTFOUND,EXCLUDE 127.0.0.1,EXCLUDE localhost',
+          // Desativa os subsistemas de DNS/rede que operam fora do tunnel do proxy
+          '--disable-features=AsyncDns,DnsOverHttpsUpgrade,PrivacyDnsTokenIssues,NetworkPrediction,ParallelDownloading',
+          // Garante roteamento SOCKS5 via flag explícita do Chromium
+          ...(isSocks5Proxy || forwarder
+            ? [`--proxy-server=socks5://127.0.0.1:${forwarder?.port ?? proxyPort}`]
+            : [])
+        ]
+      : []
+
     const context = await playwrightChromium.launchPersistentContext(userDataDir, {
       channel: 'chrome',
       headless: false,
@@ -175,16 +347,17 @@ export async function launchProfile(profileId: string): Promise<BrowserContext> 
       args: [
         '--enable-extensions',
         '--no-first-run',
-        '--start-maximized', // Maximizar janela ao iniciar
+        '--start-maximized',
         '--disable-infobars',
+        '--test-type',
         '--disable-renderer-backgrounding',
         '--password-store=basic',
         '--use-mock-keychain',
-        `--lang=${profile.locale || 'de-DE'}`
+        `--lang=${profile.locale || 'de-DE'}`,
+        ...networkIsolationArgs
       ],
-      // STEALTH: User Agent
-      // Se não definido, usa o nativo do navegador (Mais seguro para evitar mismatch de versão)
-      userAgent: profile.userAgent || undefined,
+      // STEALTH: UA higienizado via uaBundle — version override forçado
+      userAgent: uaBundle.userAgent,
 
       // DOWNLOADS: Pasta isolada para cada perfil na pasta de Downloads do usuário
       // Estrutura: Downloads/SuiteBrowser/{profile_id}
@@ -202,237 +375,380 @@ export async function launchProfile(profileId: string): Promise<BrowserContext> 
     console.log(`[Engine] Injecting Fingerprint Protection:`, fingerprintArgs)
 
     // STEALTH VIA JS (Recusa robusta de fingerprinting)
-    await context.addInitScript((args) => {
-      const { seed, vendor, renderer } = args
+    await context.addInitScript(
+      (args) => {
+        const { seed, vendor, renderer, screenWidth, screenHeight } = args
 
-      // --- UTILS: Native Code Emulation ---
-      // Make our overrides look like native functions
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const makeNative = (func: (...args: any[]) => any, key: string): void => {
-        // @ts-ignore: overwriting native toString
-        Object.defineProperty(func, 'toString', {
-          value: () => `function ${key}() { [native code] }`,
-          configurable: true,
-          writable: true
-        })
-        // @ts-ignore: defining name property
-        Object.defineProperty(func, 'name', { value: key, configurable: true })
-      }
-
-      // --- CANVAS FINGERPRINT PROTECTION (NOISE INJECTION) ---
-      try {
-        const originalToDataURL = HTMLCanvasElement.prototype.toDataURL
-        const originalToBlob = HTMLCanvasElement.prototype.toBlob
-        const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData
-
-        // Deterministic PRNG based on Seed
-        const getNoise = (index: number, channel: number): number => {
-          const base = (seed % 100000) + index * 0.01 + channel * 10
-          const random = Math.sin(base) * 10000
-          const noise = Math.floor(random) % 4
-          // 25% chance of -1, 25% chance of 1, 50% chance of 0 (roughly)
-          if (noise === 0) return -1
-          if (noise === 1) return 1
-          return 0
-        }
-
-        // 1. Intercept getImageData (The core of 2D fingerprinting)
-        // @ts-ignore: overwriting getImageData
-        CanvasRenderingContext2D.prototype.getImageData = function (
-          x: number,
-          y: number,
-          w: number,
-          h: number,
-          settings?: ImageDataSettings
-        ) {
-          // @ts-ignore: calling original
-          const imageData = originalGetImageData.apply(this, [x, y, w, h, settings])
-          if (!imageData) return imageData
-
-          const { width, height, data } = imageData
-
-          for (let i = 0; i < height; i++) {
-            for (let j = 0; j < width; j++) {
-              const pixelIndex = i * width + j
-              const arrayIndex = pixelIndex * 4
-              // Modify RGB slightly
-              data[arrayIndex] += getNoise(pixelIndex, 0)
-              data[arrayIndex + 1] += getNoise(pixelIndex, 1)
-              data[arrayIndex + 2] += getNoise(pixelIndex, 2)
-            }
-          }
-          return imageData
-        }
-        makeNative(CanvasRenderingContext2D.prototype.getImageData, 'getImageData')
-
-        // 2. Intercept toDataURL
-        // @ts-ignore: overwriting toDataURL
-        HTMLCanvasElement.prototype.toDataURL = function (type?: string, encoderOptions?: any) {
-          const context = this.getContext('2d')
-          if (context) {
-            const w = this.width
-            const h = this.height
-            const noisyData = context.getImageData(0, 0, w, h)
-            const shadowCanvas = document.createElement('canvas')
-            shadowCanvas.width = w
-            shadowCanvas.height = h
-            const shadowCtx = shadowCanvas.getContext('2d')
-            if (shadowCtx) {
-              shadowCtx.putImageData(noisyData, 0, 0)
-              return originalToDataURL.apply(shadowCanvas, [type, encoderOptions])
-            }
-          }
-          return originalToDataURL.apply(this, [type, encoderOptions])
-        }
-        makeNative(HTMLCanvasElement.prototype.toDataURL, 'toDataURL')
-
-        // 3. Intercept toBlob
-        // @ts-ignore: overwriting toBlob
-        HTMLCanvasElement.prototype.toBlob = function (
-          callback: BlobCallback,
-          type?: string,
-          quality?: any
-        ) {
-          const context = this.getContext('2d')
-          if (context) {
-            const w = this.width
-            const h = this.height
-            const noisyData = context.getImageData(0, 0, w, h)
-            const shadowCanvas = document.createElement('canvas')
-            shadowCanvas.width = w
-            shadowCanvas.height = h
-            const shadowCtx = shadowCanvas.getContext('2d')
-            if (shadowCtx) {
-              shadowCtx.putImageData(noisyData, 0, 0)
-              return originalToBlob.apply(shadowCanvas, [callback, type, quality])
-            }
-          }
-          return originalToBlob.apply(this, [callback, type, quality])
-        }
-        makeNative(HTMLCanvasElement.prototype.toBlob, 'toBlob')
-      } catch (e) {
-        console.error('Failed to inject Canvas noise:', e)
-      }
-
-      // --- 1. WEBDRIVER (The most common tell) ---
-      // Remove the property completely from the prototype chain
-      try {
-        // @ts-ignore: deleting webdriver property
-        delete Object.getPrototypeOf(navigator).webdriver
-      } catch {
-        // ignore
-      }
-
-      // Also define it as false on the instance just in case
-      Object.defineProperty(navigator, 'webdriver', {
-        get: () => false,
-        configurable: true,
-        enumerable: true // Native properties are often enumerable
-      })
-
-      // --- 2. CHROME OBJECT ---
-      // Ensure window.chrome exists and looks real
-      // @ts-ignore: polyfilling chrome object
-      if (!window.chrome) {
-        // @ts-ignore: polyfilling chrome object
-        window.chrome = {
-          runtime: {},
-          app: {
-            isInstalled: false,
-            InstallState: {
-              DISABLED: 'disabled',
-              INSTALLED: 'installed',
-              NOT_INSTALLED: 'not_installed'
-            },
-            RunningState: {
-              CANNOT_RUN: 'cannot_run',
-              READY_TO_RUN: 'ready_to_run',
-              RUNNING: 'running'
-            }
-          },
-          csi: () => {},
-          loadTimes: () => {}
-        }
-      }
-
-      // --- 3. PERMISSIONS ---
-      // Robustly handle permission queries without leaking 'Illegal invocation'
-      if (navigator.permissions && navigator.permissions.query) {
-        const originalQuery = navigator.permissions.query
-        // @ts-ignore: overwriting permissions query
-        navigator.permissions.query = function (parameters: PermissionDescriptor) {
-          // Cloudflare/Google often check for 'notifications' permission
-          if (parameters && parameters.name === 'notifications') {
-            return Promise.resolve({ state: Notification.permission })
-          }
-          // Ensure correct 'this' context
-          return originalQuery.call(this, parameters)
-        }
-        // Mask the string representation
-        makeNative(navigator.permissions.query, 'query')
-      }
-
-      // --- 4. WEBGL VENDOR/RENDERER (Dynamic Spoofing) ---
-      try {
-        const getParameter = WebGLRenderingContext.prototype.getParameter
-        // @ts-ignore: overwriting getParameter
-        WebGLRenderingContext.prototype.getParameter = function (parameter) {
-          // UNMASKED_VENDOR_WEBGL
-          if (parameter === 37445) {
-            return vendor
-          }
-          // UNMASKED_RENDERER_WEBGL
-          if (parameter === 37446) {
-            return renderer
-          }
-          return getParameter.apply(this, [parameter])
-        }
-        makeNative(WebGLRenderingContext.prototype.getParameter, 'getParameter')
-
-        // Handle WebGL2
-        if (typeof WebGL2RenderingContext !== 'undefined') {
-          const getParameter2 = WebGL2RenderingContext.prototype.getParameter
-          // @ts-ignore: overwriting getParameter
-          WebGL2RenderingContext.prototype.getParameter = function (parameter) {
-            if (parameter === 37445) return vendor
-            if (parameter === 37446) return renderer
-            return getParameter2.apply(this, [parameter])
-          }
-          makeNative(WebGL2RenderingContext.prototype.getParameter, 'getParameter')
-        }
-      } catch {
-        // ignore
-      }
-
-      // --- 5. PLUGINS (Subtle Adjustment) ---
-      // Only mess with plugins if strictly necessary.
-      // In headed mode, browsers have plugins. Empty arrays are suspicious.
-      // We leave the default plugins alone as we are in a real Chrome instance.
-      // However, we ensure the prototype is correct if we ever did modify it.
-      // (Skipping aggressive plugin mocking to avoid mismatches)
-
-      // --- 6. WEBRTC (Prevent Leaks) ---
-      // @ts-ignore: accessing RTCPeerConnection
-      const originalRTCPeerConnection = window.RTCPeerConnection
-      // @ts-ignore: accessing RTCPeerConnection
-      if (originalRTCPeerConnection) {
+        // --- UTILS: Native Code Emulation ---
+        // Make our overrides look like native functions
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const fakeRTCPeerConnection = function (config: RTCConfiguration): any {
-          if (config && config.iceServers) {
-            config.iceTransportPolicy = 'relay'
-          }
-          // @ts-ignore: constructor call: constructor call
-          return new originalRTCPeerConnection(config)
+        const makeNative = (func: (...args: any[]) => any, key: string): void => {
+          // @ts-ignore: overwriting native toString
+          Object.defineProperty(func, 'toString', {
+            value: () => `function ${key}() { [native code] }`,
+            configurable: true,
+            writable: true
+          })
+          // @ts-ignore: defining name property
+          Object.defineProperty(func, 'name', { value: key, configurable: true })
         }
-        fakeRTCPeerConnection.prototype = originalRTCPeerConnection.prototype
-        // @ts-ignore: setting global RTCPeerConnection
-        window.RTCPeerConnection = fakeRTCPeerConnection
 
-        // Hide the override
-        // @ts-ignore: fixing makeNative type compatibility
-        makeNative(window.RTCPeerConnection, 'RTCPeerConnection')
-      }
-    }, fingerprintArgs)
+        // --- CANVAS FINGERPRINT PROTECTION (NOISE INJECTION) ---
+        try {
+          const originalToDataURL = HTMLCanvasElement.prototype.toDataURL
+          const originalToBlob = HTMLCanvasElement.prototype.toBlob
+          const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData
+
+          // Deterministic PRNG based on Seed using Mulberry32
+          const mulberry32 = (a: number) => {
+            return function () {
+              let t = (a += 0x6d2b79f5)
+              t = Math.imul(t ^ (t >>> 15), t | 1)
+              t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+              return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+            }
+          }
+
+          // Instancia o gerador
+          const prng = mulberry32(seed)
+
+          // Função de ruído sutil (-1, 0, 1) baseado no PRNG + index
+          // Usa PRNG mas com base em um offset para não gerar a MESMA aleatoriedade em toda a tela sequencialmente.
+          // Como precisamos de performance, pegamos um numero PRNG base para a "sessão" da função e aplicamos offsets rápidos
+          const sessionRandom = prng()
+          const getNoise = (index: number): number => {
+            const raw = ((sessionRandom * 1000 + index) * 23.14) % 1
+            if (raw < 0.3) return -1
+            if (raw > 0.7) return 1
+            return 0
+          }
+
+          // 1. Intercept getImageData (The core of 2D fingerprinting)
+          // @ts-ignore: overwriting getImageData
+          CanvasRenderingContext2D.prototype.getImageData = function (
+            x: number,
+            y: number,
+            w: number,
+            h: number,
+            settings?: ImageDataSettings
+          ) {
+            // @ts-ignore: calling original
+            const imageData = originalGetImageData.apply(this, [x, y, w, h, settings])
+            if (!imageData) return imageData
+
+            const { width, height, data } = imageData
+
+            for (let i = 0; i < height; i++) {
+              for (let j = 0; j < width; j++) {
+                const pixelIndex = i * width + j
+                const arrayIndex = pixelIndex * 4
+                // Apenas modifica sutilmente o canal R (ou Alpha dependendo da escolha).
+                // Vamos alterar apenas o Red channel neste caso para causar alteração de hash em vez de cor perceptivel
+                const noise = getNoise(pixelIndex)
+                data[arrayIndex] = Math.max(0, Math.min(255, data[arrayIndex] + noise))
+              }
+            }
+            return imageData
+          }
+          makeNative(CanvasRenderingContext2D.prototype.getImageData, 'getImageData')
+
+          // 2. Intercept toDataURL
+          // @ts-ignore: overwriting toDataURL
+          HTMLCanvasElement.prototype.toDataURL = function (
+            type?: string,
+            encoderOptions?: number | undefined
+          ) {
+            const context = this.getContext('2d')
+            if (context) {
+              const w = this.width
+              const h = this.height
+              const noisyData = context.getImageData(0, 0, w, h)
+              const shadowCanvas = document.createElement('canvas')
+              shadowCanvas.width = w
+              shadowCanvas.height = h
+              const shadowCtx = shadowCanvas.getContext('2d')
+              if (shadowCtx) {
+                shadowCtx.putImageData(noisyData, 0, 0)
+                return originalToDataURL.apply(shadowCanvas, [type, encoderOptions])
+              }
+            }
+            return originalToDataURL.apply(this, [type, encoderOptions])
+          }
+          makeNative(HTMLCanvasElement.prototype.toDataURL, 'toDataURL')
+
+          // 3. Intercept toBlob
+          // @ts-ignore: overwriting toBlob
+          HTMLCanvasElement.prototype.toBlob = function (
+            callback: BlobCallback,
+            type?: string,
+            quality?: number | undefined
+          ) {
+            const context = this.getContext('2d')
+            if (context) {
+              const w = this.width
+              const h = this.height
+              const noisyData = context.getImageData(0, 0, w, h)
+              const shadowCanvas = document.createElement('canvas')
+              shadowCanvas.width = w
+              shadowCanvas.height = h
+              const shadowCtx = shadowCanvas.getContext('2d')
+              if (shadowCtx) {
+                shadowCtx.putImageData(noisyData, 0, 0)
+                return originalToBlob.apply(shadowCanvas, [callback, type, quality])
+              }
+            }
+            return originalToBlob.apply(this, [callback, type, quality])
+          }
+          makeNative(HTMLCanvasElement.prototype.toBlob, 'toBlob')
+        } catch {
+          // ignore
+        }
+
+        // --- AUDIO FINGERPRINT PROTECTION ---
+        try {
+          // AnalyserNode protect (getFloatFrequencyData)
+          if (typeof AnalyserNode !== 'undefined') {
+            const originalGetFloatFrequencyData = AnalyserNode.prototype.getFloatFrequencyData
+            // @ts-ignore: overwriting getFloatFrequencyData
+            AnalyserNode.prototype.getFloatFrequencyData = function (array: Float32Array) {
+              // @ts-ignore: array buffer type mismatch expected due to cross-world
+              originalGetFloatFrequencyData.apply(this, [array])
+              const prng = (Math.sin(seed) * 10000) % 1
+              for (let i = 0; i < array.length; i++) {
+                // Add imperceptible float noise to frequencies
+                array[i] += prng * 0.0001 - 0.00005
+              }
+            }
+            makeNative(AnalyserNode.prototype.getFloatFrequencyData, 'getFloatFrequencyData')
+          }
+
+          // AudioBuffer protect (getChannelData)
+          if (typeof AudioBuffer !== 'undefined') {
+            const originalGetChannelData = AudioBuffer.prototype.getChannelData
+            // @ts-ignore: overwriting getChannelData
+            AudioBuffer.prototype.getChannelData = function (channel: number) {
+              const array = originalGetChannelData.apply(this, [channel])
+              const sessionRandom = (Math.sin(seed + channel) * 10000) % 1
+              for (let i = 0; i < array.length; i++) {
+                // Add imperceptible noise to waveforms
+                array[i] += sessionRandom * 0.0000001 - 0.00000005
+              }
+              return array
+            }
+            makeNative(AudioBuffer.prototype.getChannelData, 'getChannelData')
+          }
+        } catch {
+          // ignore
+        }
+
+        // --- 1. WEBDRIVER (The most common tell) ---
+        // Remove the property completely from the prototype chain
+        try {
+          // @ts-ignore: deleting webdriver property
+          delete Object.getPrototypeOf(navigator).webdriver
+        } catch {
+          // ignore
+        }
+
+        // Also define it as false on the instance just in case
+        Object.defineProperty(navigator, 'webdriver', {
+          get: () => false,
+          configurable: true,
+          enumerable: true // Native properties are often enumerable
+        })
+
+        // --- 2. CHROME OBJECT ---
+        // Ensure window.chrome exists and looks real
+        // @ts-ignore: polyfilling chrome object
+        if (!window.chrome) {
+          // @ts-ignore: polyfilling chrome object
+          window.chrome = {
+            runtime: {},
+            app: {
+              isInstalled: false,
+              InstallState: {
+                DISABLED: 'disabled',
+                INSTALLED: 'installed',
+                NOT_INSTALLED: 'not_installed'
+              },
+              RunningState: {
+                CANNOT_RUN: 'cannot_run',
+                READY_TO_RUN: 'ready_to_run',
+                RUNNING: 'running'
+              }
+            },
+            csi: () => {},
+            loadTimes: () => {}
+          }
+        }
+
+        // --- 3. PERMISSIONS ---
+        // Robustly handle permission queries without leaking 'Illegal invocation'
+        if (navigator.permissions && navigator.permissions.query) {
+          const originalQuery = navigator.permissions.query
+          // @ts-ignore: overwriting permissions query
+          navigator.permissions.query = function (parameters: PermissionDescriptor) {
+            // Cloudflare/Google often check for 'notifications' permission
+            if (parameters && parameters.name === 'notifications') {
+              return Promise.resolve({ state: Notification.permission })
+            }
+            // Ensure correct 'this' context
+            return originalQuery.call(this, parameters)
+          }
+          // Mask the string representation
+          makeNative(navigator.permissions.query, 'query')
+        }
+
+        // --- 4. WEBGL VENDOR/RENDERER & READPIXELS (Dynamic Spoofing) ---
+        try {
+          // --- WebGL1 ---
+          if (typeof WebGLRenderingContext !== 'undefined') {
+            const getParameter = WebGLRenderingContext.prototype.getParameter
+            // @ts-ignore: overwriting getParameter
+            WebGLRenderingContext.prototype.getParameter = function (parameter) {
+              // UNMASKED_VENDOR_WEBGL
+              if (parameter === 37445) return vendor
+              // UNMASKED_RENDERER_WEBGL
+              if (parameter === 37446) return renderer
+              return getParameter.apply(this, [parameter])
+            }
+            makeNative(WebGLRenderingContext.prototype.getParameter, 'getParameter')
+
+            const originalReadPixels = WebGLRenderingContext.prototype.readPixels
+            // @ts-ignore: overwriting readPixels
+            WebGLRenderingContext.prototype.readPixels = function (
+              x,
+              y,
+              width,
+              height,
+              format,
+              type,
+              pixels
+            ) {
+              originalReadPixels.apply(this, [x, y, width, height, format, type, pixels])
+              if (pixels && pixels.length) {
+                const prngSession = (Math.sin(seed * 1.5) * 10000) % 1
+                for (let i = 0; i < pixels.length; i += 4) {
+                  // Modify Red channel or RGB subtly for 3D render extraction
+                  const noise = ((prngSession + i) * 12.3) % 1
+                  const shift = noise < 0.3 ? -1 : noise > 0.7 ? 1 : 0
+                  // @ts-ignore: index set access on typed array abstraction
+                  pixels[i] = Math.max(0, Math.min(255, pixels[i] + shift))
+                }
+              }
+            }
+            makeNative(WebGLRenderingContext.prototype.readPixels, 'readPixels')
+          }
+
+          // --- WebGL2 ---
+          if (typeof WebGL2RenderingContext !== 'undefined') {
+            const getParameter2 = WebGL2RenderingContext.prototype.getParameter
+            // @ts-ignore: overwriting getParameter
+            WebGL2RenderingContext.prototype.getParameter = function (parameter) {
+              if (parameter === 37445) return vendor
+              if (parameter === 37446) return renderer
+              return getParameter2.apply(this, [parameter])
+            }
+            makeNative(WebGL2RenderingContext.prototype.getParameter, 'getParameter')
+
+            const originalReadPixels2 = WebGL2RenderingContext.prototype.readPixels
+            // @ts-ignore: overwriting readPixels
+            WebGL2RenderingContext.prototype.readPixels = function (
+              x,
+              y,
+              width,
+              height,
+              format,
+              type,
+              pixels,
+              dstOffset
+            ) {
+              originalReadPixels2.apply(this, [
+                x,
+                y,
+                width,
+                height,
+                format,
+                type,
+                pixels,
+                dstOffset
+              ])
+              if (pixels && pixels.length) {
+                const prngSession = (Math.sin(seed * 1.5) * 10000) % 1
+                const start = dstOffset || 0
+                for (let i = start; i < pixels.length; i += 4) {
+                  const noise = ((prngSession + i) * 12.3) % 1
+                  const shift = noise < 0.3 ? -1 : noise > 0.7 ? 1 : 0
+                  // @ts-ignore: index set access on typed array abstraction
+                  pixels[i] = Math.max(0, Math.min(255, pixels[i] + shift))
+                }
+              }
+            }
+            makeNative(WebGL2RenderingContext.prototype.readPixels, 'readPixels')
+          }
+        } catch {
+          // ignore
+        }
+
+        // --- 5. PLUGINS (Subtle Adjustment) ---
+        // Only mess with plugins if strictly necessary.
+        // In headed mode, browsers have plugins. Empty arrays are suspicious.
+        // We leave the default plugins alone as we are in a real Chrome instance.
+        // However, we ensure the prototype is correct if we ever did modify it.
+        // (Skipping aggressive plugin mocking to avoid mismatches)
+
+        // --- 6. WEBRTC (Prevent Leaks) ---
+        // @ts-ignore: accessing RTCPeerConnection
+        const originalRTCPeerConnection = window.RTCPeerConnection
+        // @ts-ignore: accessing RTCPeerConnection
+        if (originalRTCPeerConnection) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const fakeRTCPeerConnection = function (config: RTCConfiguration): any {
+            if (config && config.iceServers) {
+              config.iceTransportPolicy = 'relay'
+            }
+            // @ts-ignore: constructor call: constructor call
+            return new originalRTCPeerConnection(config)
+          }
+          fakeRTCPeerConnection.prototype = originalRTCPeerConnection.prototype
+          // @ts-ignore: setting global RTCPeerConnection
+          window.RTCPeerConnection = fakeRTCPeerConnection
+
+          // Hide the override
+          // @ts-ignore: fixing makeNative type compatibility
+          makeNative(window.RTCPeerConnection, 'RTCPeerConnection')
+        }
+
+        // --- 7. SCREEN FINGERPRINT PROTECTION ---
+        // O CDP cobre a camada de rede, mas scripts agressivos leem window.screen diretamente.
+        // Object.defineProperty garante que o valor retornado seja sempre o valor spoofado.
+        try {
+          const defineScreen = (prop: string, value: number): void => {
+            Object.defineProperty(screen, prop, {
+              get: () => value,
+              configurable: true,
+              enumerable: true
+            })
+          }
+
+          defineScreen('width', screenWidth)
+          defineScreen('height', screenHeight)
+          defineScreen('availWidth', screenWidth)
+          defineScreen('availHeight', screenHeight - 40) // 40px reservados para a taskbar
+          defineScreen('colorDepth', 24)
+          defineScreen('pixelDepth', 24)
+
+          Object.defineProperty(window, 'devicePixelRatio', {
+            get: () => 1,
+            configurable: true,
+            enumerable: true
+          })
+        } catch {
+          // ignore
+        }
+      },
+      { ...fingerprintArgs, screenWidth: SPOOFED_SCREEN.width, screenHeight: SPOOFED_SCREEN.height }
+    )
 
     // Store context
     runningContexts.set(profileId, context)
@@ -504,7 +820,12 @@ export async function launchProfile(profileId: string): Promise<BrowserContext> 
     }
 
     // Função auxiliar para configurar handlers de página
-    const setupPage = (page): void => {
+    const setupPage = (page: Page): void => {
+      // Sempre aplica o override para manter a consistência entre páginas
+      applyUAOverride(page, uaBundle, profile.locale).catch((e) =>
+        console.warn('[Engine] Erro ao aplicar UA override em nova página:', e)
+      )
+
       page.on('close', handlePageClose)
       trackDataUsage(page) // Attach tracker
 
@@ -541,11 +862,15 @@ export async function launchProfile(profileId: string): Promise<BrowserContext> 
       setupPage(page)
     })
 
-    // Ensure final save on close, hook into the existing close logic isn't enough because context.on('close') is called after closure.
-    // We need to ensure we save before destroying the context reference or when stopping.
+    // Atrela o encerramento do forwarder ao fechamento do context
+    // Garante que nenhuma porta ou processo fique em background após o perfil fechar
     const originalClose = context.close.bind(context)
     context.close = async () => {
-      await saveUsage() // Final save
+      await saveUsage()
+      if (forwarder) {
+        forwarder.close()
+        forwarder = null
+      }
       return originalClose()
     }
 
@@ -553,6 +878,11 @@ export async function launchProfile(profileId: string): Promise<BrowserContext> 
     await ProfileManager.update(profile.id, { lastUsed: new Date().toISOString() })
 
     const page = context.pages().length > 0 ? context.pages()[0] : await context.newPage()
+
+    await applyUAOverride(page, uaBundle, profile.locale)
+    console.log(
+      `[Engine] UA/Screen Override persistente aplicado. Chrome ${uaBundle.userAgentMetadata.fullVersionList[0]?.version}`
+    )
 
     try {
       await page.goto('https://www.google.com', { waitUntil: 'domcontentloaded', timeout: 15000 })
